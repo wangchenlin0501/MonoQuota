@@ -320,9 +320,6 @@ private struct DetailView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Codex 额度")
                         .font(.system(size: 16, weight: .bold))
-                    Text("5 小时与周额度 · 剩余量")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
                 }
                 Spacer()
                 if model.isRefreshing { ProgressView().controlSize(.small) }
@@ -391,61 +388,6 @@ private struct DetailView: View {
     }
 }
 
-private final class MeterContentView: NSView {
-    var image: NSImage? { didSet { needsDisplay = true } }
-    override func draw(_ dirtyRect: NSRect) {
-        guard let image else { return }
-        image.draw(in: NSRect(x: (bounds.width - image.size.width) / 2,
-                              y: (bounds.height - image.size.height) / 2,
-                              width: image.size.width, height: image.size.height))
-    }
-}
-
-private final class SelectionBackdrop: NSView {
-    private let plainContent = MeterContentView()
-    private let selectedContent = MeterContentView()
-    private let material: NSView
-    var image: NSImage? {
-        didSet { plainContent.image = image; selectedContent.image = image }
-    }
-    var isSelected = false {
-        didSet { material.isHidden = !isSelected; plainContent.isHidden = isSelected }
-    }
-    override init(frame: NSRect) {
-        if #available(macOS 26.0, *) {
-            let glass = NSGlassEffectView()
-            glass.style = .regular
-            glass.cornerRadius = 11
-            glass.contentView = selectedContent
-            material = glass
-        } else {
-            let effect = NSVisualEffectView()
-            effect.material = .selection
-            effect.state = .active
-            effect.wantsLayer = true
-            effect.layer?.cornerRadius = 11
-            effect.layer?.masksToBounds = true
-            effect.addSubview(selectedContent)
-            material = effect
-        }
-        super.init(frame: frame)
-        addSubview(material)
-        addSubview(plainContent)
-        material.isHidden = true
-    }
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-    override func hitTest(_ point: NSPoint) -> NSView? { nil }
-    override func layout() {
-        super.layout()
-        material.frame = bounds
-        plainContent.frame = bounds
-        selectedContent.frame = material.bounds
-        if #available(macOS 26.0, *), let glass = material as? NSGlassEffectView {
-            glass.cornerRadius = bounds.height / 2
-        }
-    }
-}
-
 private final class QuotaPanel: NSPanel {
     var onDismiss: (() -> Void)?
     override var canBecomeKey: Bool { true }
@@ -455,7 +397,6 @@ private final class QuotaPanel: NSPanel {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-    private let selectionBackdrop = SelectionBackdrop()
     private let panel = QuotaPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
     private let model = DetailModel()
     private var timer: Timer?
@@ -495,10 +436,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.onDisplayModeChanged = { [weak self] in self?.updateMeter() }
         if let button = statusItem.button {
             button.imagePosition = .imageOnly
-            selectionBackdrop.frame = button.bounds
-            selectionBackdrop.autoresizingMask = [.width, .height]
-            selectionBackdrop.isSelected = false
-            button.addSubview(selectionBackdrop)
             button.toolTip = "Codex 剩余额度：5 小时与周额度"
             button.target = self
             button.action = #selector(togglePopover)
@@ -537,14 +474,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func updateMeter() {
-        selectionBackdrop.image = MeterRenderer.image(
+        statusItem.button?.image = MeterRenderer.image(
             fiveHour: model.snapshot?.fiveHour.remainingPercent,
             week: model.snapshot?.week.remainingPercent,
             fiveMode: model.fiveMode,
             weekMode: model.weekMode
         )
         statusItem.length = MeterRenderer.size(fiveMode: model.fiveMode,
-                                               weekMode: model.weekMode).width + 8
+                                               weekMode: model.weekMode).width + 4
     }
 
     @objc private func togglePopover() {
@@ -582,22 +519,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     screen.visibleFrame.maxX - size.width - 8)
         panel.setFrame(NSRect(x: x, y: top - size.height, width: size.width, height: size.height), display: true)
         panel.makeKeyAndOrderFront(nil)
-        // Native glass owns its content view, keeping all text above the material.
-        selectionBackdrop.isSelected = true
-        selectionBackdrop.needsDisplay = true
         watchOutsideClicks()
-        if CommandLine.arguments.contains("--check-selection") {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [self] in
-                // Simulate AppKit clearing the temporary pressed state after mouse-up.
-                button.highlight(false)
-                let stayedSelected = panel.isVisible && selectionBackdrop.isSelected
-                    && selectionBackdrop.superview === button && selectionBackdrop.bounds.width > 0
-                hidePanel()
-                let cleared = !selectionBackdrop.isSelected && !panel.isVisible
-                print(stayedSelected && cleared ? "PASS: selection persists after mouse-up and clears on dismissal" : "FAIL: selection state")
-                exit(stayedSelected && cleared ? 0 : 1)
-            }
-        }
         if CommandLine.arguments.contains("--check-panel") {
             let frame = panel.frame
             print("Panel: \(frame); menu item: \(anchor); usable screen: \(screen.visibleFrame)")
@@ -623,7 +545,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func hidePanel() {
         panel.orderOut(nil)
-        selectionBackdrop.isSelected = false
         statusItem.button?.state = .off
         statusItem.button?.highlight(false)
         stopOutsideClickMonitoring()
