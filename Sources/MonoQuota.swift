@@ -391,6 +391,14 @@ private struct DetailView: View {
     }
 }
 
+private final class SelectionBackdrop: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.labelColor.withAlphaComponent(0.18).setFill()
+        NSBezierPath(roundedRect: bounds.insetBy(dx: 0, dy: 1), xRadius: 9, yRadius: 9).fill()
+    }
+}
+
 private final class QuotaPanel: NSPanel {
     var onDismiss: (() -> Void)?
     override var canBecomeKey: Bool { true }
@@ -400,6 +408,7 @@ private final class QuotaPanel: NSPanel {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    private let selectionBackdrop = SelectionBackdrop()
     private let panel = QuotaPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
     private let model = DetailModel()
     private var timer: Timer?
@@ -439,7 +448,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.onDisplayModeChanged = { [weak self] in self?.updateMeter() }
         if let button = statusItem.button {
             button.imagePosition = .imageOnly
-            (button.cell as? NSButtonCell)?.showsStateBy = .changeBackgroundCellMask
+            selectionBackdrop.frame = button.bounds
+            selectionBackdrop.autoresizingMask = [.width, .height]
+            selectionBackdrop.isHidden = true
+            button.addSubview(selectionBackdrop)
             button.toolTip = "Codex 剩余额度：5 小时与周额度"
             button.target = self
             button.action = #selector(togglePopover)
@@ -523,15 +535,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     screen.visibleFrame.maxX - size.width - 8)
         panel.setFrame(NSRect(x: x, y: top - size.height, width: size.width, height: size.height), display: true)
         panel.makeKeyAndOrderFront(nil)
-        button.state = .on
-        button.highlight(true)
-        // Mouse tracking clears the pressed highlight after the action returns.
-        // Reapply the panel's persistent selection on the next event-loop turn.
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.statusItem.button?.highlight(self.panel.isVisible)
-        }
+        // This independent background cannot be cleared by NSButton's mouse tracking.
+        selectionBackdrop.isHidden = false
+        selectionBackdrop.needsDisplay = true
         watchOutsideClicks()
+        if CommandLine.arguments.contains("--check-selection") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [self] in
+                // Simulate AppKit clearing the temporary pressed state after mouse-up.
+                button.highlight(false)
+                let stayedSelected = panel.isVisible && !selectionBackdrop.isHidden
+                    && selectionBackdrop.superview === button && selectionBackdrop.bounds.width > 0
+                hidePanel()
+                let cleared = selectionBackdrop.isHidden && !panel.isVisible
+                print(stayedSelected && cleared ? "PASS: selection persists after mouse-up and clears on dismissal" : "FAIL: selection state")
+                exit(stayedSelected && cleared ? 0 : 1)
+            }
+        }
         if CommandLine.arguments.contains("--check-panel") {
             let frame = panel.frame
             print("Panel: \(frame); menu item: \(anchor); usable screen: \(screen.visibleFrame)")
@@ -557,6 +576,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func hidePanel() {
         panel.orderOut(nil)
+        selectionBackdrop.isHidden = true
         statusItem.button?.state = .off
         statusItem.button?.highlight(false)
         stopOutsideClickMonitoring()
