@@ -122,7 +122,9 @@ private enum DisplayMode: String, CaseIterable {
 private enum MeterRenderer {
     private static let labelWidth: CGFloat = 30
     private static let barWidth: CGFloat = 48
-    private static let numberWidth: CGFloat = 28
+    private static let numberWidth: CGFloat = ceil(("100%" as NSString).size(withAttributes: [
+        .font: NSFont.monospacedDigitSystemFont(ofSize: 8, weight: .semibold)
+    ]).width)
 
     static func size(fiveMode: DisplayMode, weekMode: DisplayMode) -> NSSize {
         let contentWidth = max(rowWidth(fiveMode), rowWidth(weekMode))
@@ -248,6 +250,13 @@ private struct QuotaCard: View {
                                     .fill(LinearGradient(colors: [tint.opacity(0.72), tint],
                                                          startPoint: .leading, endPoint: .trailing))
                                     .frame(width: geometry.size.width * CGFloat(remaining) / 100)
+                                    .overlay(alignment: .top) {
+                                        Capsule().fill(.white.opacity(0.30)).frame(height: 1.5)
+                                            .padding(.horizontal, 3)
+                                    }
+                                    .shadow(color: tint.opacity(0.28), radius: 4, y: 0)
+                                    .shadow(color: tint.opacity(0.12), radius: 8, y: 0)
+                                    .animation(.easeInOut(duration: 0.55), value: remaining)
                             }
                         }
                     }
@@ -330,10 +339,10 @@ private struct DetailView: View {
                 Text("打开额度面板")
                     .font(.system(size: 11, weight: .medium))
                 Spacer()
-                Text(model.isRecordingShortcut ? "请按下快捷键…" : model.shortcutLabel)
+                Text(model.isRecordingShortcut ? "请按新组合键…" : model.shortcutLabel)
                     .font(.system(size: 11, weight: .medium, design: .rounded))
                     .foregroundStyle(.secondary)
-                Button(model.isRecordingShortcut ? "取消" : "录制", action: recordShortcut)
+                Button(model.isRecordingShortcut ? "取消" : "设置快捷键", action: recordShortcut)
                 if model.shortcutLabel != "未设置" {
                     Button("清除", action: clearShortcut)
                 }
@@ -382,9 +391,16 @@ private struct DetailView: View {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
+private final class QuotaPanel: NSPanel {
+    var onDismiss: (() -> Void)?
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+    override func cancelOperation(_ sender: Any?) { onDismiss?() }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-    private let popover = NSPopover()
+    private let panel = QuotaPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
     private let model = DetailModel()
     private var timer: Timer?
     private var refreshing = false
@@ -427,25 +443,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             button.target = self
             button.action = #selector(togglePopover)
         }
-        popover.behavior = .transient
-        popover.delegate = self
-        popover.contentSize = NSSize(width: 356, height: 350)
-        popover.contentViewController = NSHostingController(rootView: DetailView(
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.level = .popUpMenu
+        panel.hidesOnDeactivate = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+        panel.isReleasedWhenClosed = false
+        panel.onDismiss = { [weak self] in self?.hidePanel() }
+        panel.contentViewController = NSHostingController(rootView: DetailView(
             model: model,
             refresh: { [weak self] in self?.refresh() },
             recordShortcut: { [weak self] in self?.toggleShortcutRecording() },
             clearShortcut: { [weak self] in self?.clearShortcut() }
-        ))
+        )
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18))
+        .overlay(RoundedRectangle(cornerRadius: 18).strokeBorder(.primary.opacity(0.12), lineWidth: 0.5))
+        .clipShape(RoundedRectangle(cornerRadius: 18)))
         installHotKeyHandler()
         if let data = UserDefaults.standard.data(forKey: "globalShortcut"),
            let shortcut = try? JSONDecoder().decode(SavedShortcut.self, from: data) {
             if register(shortcut) { savedShortcut = shortcut; model.shortcutLabel = shortcut.label }
-            else { model.shortcutError = "快捷键已被其他应用占用，请重新录制" }
+            else { model.shortcutError = "快捷键已被其他应用占用，请重新设置" }
         }
         updateMeter()
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             self?.refresh()
+        }
+        if CommandLine.arguments.contains("--show-panel") {
+            DispatchQueue.main.async { [weak self] in self?.togglePopoverFromShortcut() }
         }
     }
 
@@ -457,20 +484,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             weekMode: model.weekMode
         )
         statusItem.length = MeterRenderer.size(fiveMode: model.fiveMode,
-                                               weekMode: model.weekMode).width + 6
+                                               weekMode: model.weekMode).width
     }
 
     @objc private func togglePopover() {
         guard let button = statusItem.button else { return }
-        if popover.isShown {
-            popover.close()
+        if panel.isVisible {
+            hidePanel()
         } else {
-            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-            watchOutsideClicks()
+            showPopover(anchoredTo: button)
         }
     }
 
-    func popoverDidClose(_ notification: Notification) {
+    private func showPopover(anchoredTo button: NSStatusBarButton, attempt: Int = 0) {
+        guard let window = button.window, let screen = window.screen,
+              let content = panel.contentViewController?.view else { return }
+        content.layoutSubtreeIfNeeded()
+        let size = content.fittingSize
+        let anchor = window.convertToScreen(button.convert(button.bounds, to: nil))
+        // A newly created status item temporarily reports an off-screen frame.
+        guard anchor.minY >= screen.visibleFrame.maxY - 2,
+              anchor.intersects(screen.frame) else {
+            if attempt < 20 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self, weak button] in
+                    guard let self, let button else { return }
+                    self.showPopover(anchoredTo: button, attempt: attempt + 1)
+                }
+            } else if CommandLine.arguments.contains("--check-panel") {
+                print("FAIL: menu item has no valid screen position")
+                exit(1)
+            }
+            return
+        }
+        // Use screen coordinates explicitly: the entire panel stays below the menu bar.
+        let top = min(anchor.minY, screen.visibleFrame.maxY) - 4
+        let x = min(max(anchor.maxX - size.width, screen.visibleFrame.minX + 8),
+                    screen.visibleFrame.maxX - size.width - 8)
+        panel.setFrame(NSRect(x: x, y: top - size.height, width: size.width, height: size.height), display: true)
+        panel.makeKeyAndOrderFront(nil)
+        watchOutsideClicks()
+        if CommandLine.arguments.contains("--check-panel") {
+            let frame = panel.frame
+            print("Panel: \(frame); menu item: \(anchor); usable screen: \(screen.visibleFrame)")
+            let valid = frame.maxY <= anchor.minY - 4 && frame.width == 356 && frame.height > 300
+                && frame.minX >= screen.visibleFrame.minX && frame.maxX <= screen.visibleFrame.maxX
+                && frame.minY >= screen.visibleFrame.minY && frame.maxY <= screen.visibleFrame.maxY
+            print(valid ? "PASS: panel stays below menu bar and inside screen" : "FAIL: panel geometry")
+            exit(valid ? 0 : 1)
+        }
+    }
+
+    private func togglePopoverFromShortcut() {
+        if panel.isVisible { hidePanel(); return }
+        // The hotkey can arrive while another app owns the active menu bar.
+        // Activate first, then let AppKit update the status item's position before anchoring.
+        NSApp.activate(ignoringOtherApps: true)
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let button = self.statusItem.button, !self.panel.isVisible else { return }
+            self.showPopover(anchoredTo: button)
+            self.panel.makeKey()
+        }
+    }
+
+    private func hidePanel() {
+        panel.orderOut(nil)
         stopOutsideClickMonitoring()
         stopShortcutRecording()
     }
@@ -478,14 +555,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func watchOutsideClicks() {
         stopOutsideClickMonitoring()
         outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] _ in
-            self?.popover.close()
+            self?.hidePanel()
         }
         insideClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] event in
             guard let self else { return event }
-            let panelWindow = self.popover.contentViewController?.view.window
+            let panelWindow = self.panel
             let statusWindow = self.statusItem.button?.window
-            if event.window !== panelWindow && event.window !== statusWindow {
-                self.popover.close()
+            if event.window !== panelWindow && event.window !== statusWindow && event.window?.level != .popUpMenu {
+                self.hidePanel()
             }
             return event
         }
@@ -505,7 +582,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return nil
         }
         NSApp.activate(ignoringOtherApps: true)
-        popover.contentViewController?.view.window?.makeKey()
+        panel.makeKey()
     }
 
     private func stopShortcutRecording() {
@@ -578,7 +655,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         InstallEventHandler(GetApplicationEventTarget(), { _, _, userData in
             guard let userData else { return OSStatus(eventNotHandledErr) }
             let owner = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
-            owner.togglePopover()
+            owner.togglePopoverFromShortcut()
             return noErr
         }, 1, &eventType, Unmanaged.passUnretained(self).toOpaque(), &hotKeyHandler)
     }
