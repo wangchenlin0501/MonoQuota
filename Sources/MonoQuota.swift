@@ -1,6 +1,13 @@
 import AppKit
+import Carbon
 import Foundation
 import SwiftUI
+
+private struct SavedShortcut: Codable {
+    let keyCode: UInt32
+    let modifiers: UInt32
+    let label: String
+}
 
 private struct Quota: Decodable {
     struct Window: Decodable {
@@ -187,6 +194,9 @@ private final class DetailModel: ObservableObject {
         }
     }
     var onDisplayModeChanged: (() -> Void)?
+    @Published var shortcutLabel = "未设置"
+    @Published var isRecordingShortcut = false
+    @Published var shortcutError: String?
 }
 
 private struct GlassCard<Content: View>: View {
@@ -289,6 +299,8 @@ private struct QuotaCard: View {
 private struct DetailView: View {
     @ObservedObject var model: DetailModel
     let refresh: () -> Void
+    let recordShortcut: () -> Void
+    let clearShortcut: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -311,6 +323,25 @@ private struct DetailView: View {
                       tint: .cyan)
             QuotaCard(title: "周额度", symbol: "calendar", window: model.snapshot?.week,
                       tint: .indigo)
+
+            HStack(spacing: 8) {
+                Image(systemName: "keyboard")
+                    .foregroundStyle(.secondary)
+                Text("打开额度面板")
+                    .font(.system(size: 11, weight: .medium))
+                Spacer()
+                Text(model.isRecordingShortcut ? "请按下快捷键…" : model.shortcutLabel)
+                    .font(.system(size: 11, weight: .medium, design: .rounded))
+                    .foregroundStyle(.secondary)
+                Button(model.isRecordingShortcut ? "取消" : "录制", action: recordShortcut)
+                if model.shortcutLabel != "未设置" {
+                    Button("清除", action: clearShortcut)
+                }
+            }
+            .buttonStyle(.borderless)
+            if let error = model.shortcutError {
+                Text(error).font(.system(size: 10)).foregroundStyle(.red)
+            }
 
             HStack(spacing: 6) {
                 Text(model.updatedAt.map { "更新于 \($0.formatted(date: .omitted, time: .standard))" }
@@ -351,12 +382,18 @@ private struct DetailView: View {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let popover = NSPopover()
     private let model = DetailModel()
     private var timer: Timer?
     private var refreshing = false
+    private var outsideClickMonitor: Any?
+    private var insideClickMonitor: Any?
+    private var shortcutRecorder: Any?
+    private var hotKey: EventHotKeyRef?
+    private var hotKeyHandler: EventHandlerRef?
+    private var savedShortcut: SavedShortcut?
     #if PREVIEW
     private var previewWindow: NSWindow?
     #endif
@@ -372,7 +409,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 380, height: 380),
                               styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "MonoQuota 预览"
-        window.contentViewController = NSHostingController(rootView: DetailView(model: model) {})
+        window.contentViewController = NSHostingController(rootView: DetailView(model: model, refresh: {}, recordShortcut: {}, clearShortcut: {}))
         window.center()
         window.makeKeyAndOrderFront(nil)
         previewWindow = window
@@ -391,10 +428,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             button.action = #selector(togglePopover)
         }
         popover.behavior = .transient
+        popover.delegate = self
         popover.contentSize = NSSize(width: 356, height: 350)
-        popover.contentViewController = NSHostingController(rootView: DetailView(model: model) { [weak self] in
-            self?.refresh()
-        })
+        popover.contentViewController = NSHostingController(rootView: DetailView(
+            model: model,
+            refresh: { [weak self] in self?.refresh() },
+            recordShortcut: { [weak self] in self?.toggleShortcutRecording() },
+            clearShortcut: { [weak self] in self?.clearShortcut() }
+        ))
+        installHotKeyHandler()
+        if let data = UserDefaults.standard.data(forKey: "globalShortcut"),
+           let shortcut = try? JSONDecoder().decode(SavedShortcut.self, from: data) {
+            if register(shortcut) { savedShortcut = shortcut; model.shortcutLabel = shortcut.label }
+            else { model.shortcutError = "快捷键已被其他应用占用，请重新录制" }
+        }
         updateMeter()
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
@@ -416,10 +463,124 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func togglePopover() {
         guard let button = statusItem.button else { return }
         if popover.isShown {
-            popover.performClose(nil)
+            popover.close()
         } else {
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            watchOutsideClicks()
         }
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        stopOutsideClickMonitoring()
+        stopShortcutRecording()
+    }
+
+    private func watchOutsideClicks() {
+        stopOutsideClickMonitoring()
+        outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] _ in
+            self?.popover.close()
+        }
+        insideClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] event in
+            guard let self else { return event }
+            let panelWindow = self.popover.contentViewController?.view.window
+            let statusWindow = self.statusItem.button?.window
+            if event.window !== panelWindow && event.window !== statusWindow {
+                self.popover.close()
+            }
+            return event
+        }
+    }
+
+    private func stopOutsideClickMonitoring() {
+        if let outsideClickMonitor { NSEvent.removeMonitor(outsideClickMonitor); self.outsideClickMonitor = nil }
+        if let insideClickMonitor { NSEvent.removeMonitor(insideClickMonitor); self.insideClickMonitor = nil }
+    }
+
+    private func toggleShortcutRecording() {
+        if model.isRecordingShortcut { stopShortcutRecording(); return }
+        model.shortcutError = nil
+        model.isRecordingShortcut = true
+        shortcutRecorder = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            self?.captureShortcut(event)
+            return nil
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        popover.contentViewController?.view.window?.makeKey()
+    }
+
+    private func stopShortcutRecording() {
+        if let shortcutRecorder { NSEvent.removeMonitor(shortcutRecorder); self.shortcutRecorder = nil }
+        model.isRecordingShortcut = false
+    }
+
+    private func captureShortcut(_ event: NSEvent) {
+        if event.keyCode == 53 { stopShortcutRecording(); return } // Escape
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        var modifiers: UInt32 = 0
+        if flags.contains(.command) { modifiers |= UInt32(cmdKey) }
+        if flags.contains(.option) { modifiers |= UInt32(optionKey) }
+        if flags.contains(.control) { modifiers |= UInt32(controlKey) }
+        if flags.contains(.shift) { modifiers |= UInt32(shiftKey) }
+        guard flags.contains(.command) || flags.contains(.option) || flags.contains(.control) else {
+            model.shortcutError = "请同时按下 ⌘、⌥ 或 ⌃，避免占用普通输入"
+            return
+        }
+        let key = (event.charactersIgnoringModifiers ?? "").uppercased()
+        guard key.count == 1, key.unicodeScalars.first?.isASCII == true,
+              key.rangeOfCharacter(from: .alphanumerics) != nil else {
+            model.shortcutError = "请选择字母或数字键"
+            return
+        }
+        let prefix = (flags.contains(.control) ? "⌃" : "") +
+                     (flags.contains(.option) ? "⌥" : "") +
+                     (flags.contains(.shift) ? "⇧" : "") +
+                     (flags.contains(.command) ? "⌘" : "")
+        let candidate = SavedShortcut(keyCode: UInt32(event.keyCode), modifiers: modifiers,
+                                      label: prefix + key)
+        guard register(candidate) else {
+            model.shortcutError = "该快捷键已被占用，请换一个组合"
+            return
+        }
+        savedShortcut = candidate
+        model.shortcutLabel = candidate.label
+        model.shortcutError = nil
+        UserDefaults.standard.set(try? JSONEncoder().encode(candidate), forKey: "globalShortcut")
+        stopShortcutRecording()
+    }
+
+    private func clearShortcut() {
+        stopShortcutRecording()
+        if let hotKey { UnregisterEventHotKey(hotKey); self.hotKey = nil }
+        savedShortcut = nil
+        model.shortcutLabel = "未设置"
+        model.shortcutError = nil
+        UserDefaults.standard.removeObject(forKey: "globalShortcut")
+    }
+
+    private func register(_ shortcut: SavedShortcut) -> Bool {
+        // Keep the old shortcut if the new combination cannot be registered.
+        let old = savedShortcut
+        if let hotKey { UnregisterEventHotKey(hotKey); self.hotKey = nil }
+        let identifier = EventHotKeyID(signature: 0x4D515441, id: 1)
+        let result = RegisterEventHotKey(shortcut.keyCode, shortcut.modifiers, identifier,
+                                         GetApplicationEventTarget(), 0, &hotKey)
+        if result == noErr { return true }
+        if let old {
+            RegisterEventHotKey(old.keyCode, old.modifiers, identifier,
+                                GetApplicationEventTarget(), 0, &hotKey)
+        }
+        return false
+    }
+
+    private func installHotKeyHandler() {
+        var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
+                                      eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), { _, _, userData in
+            guard let userData else { return OSStatus(eventNotHandledErr) }
+            let owner = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
+            owner.togglePopover()
+            return noErr
+        }, 1, &eventType, Unmanaged.passUnretained(self).toOpaque(), &hotKeyHandler)
     }
 
     private func refresh() {
