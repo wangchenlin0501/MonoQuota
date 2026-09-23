@@ -439,6 +439,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.onDisplayModeChanged = { [weak self] in self?.updateMeter() }
         if let button = statusItem.button {
             button.imagePosition = .imageOnly
+            button.cell?.showsStateBy = .changeBackgroundCellMask
             button.toolTip = "Codex 剩余额度：5 小时与周额度"
             button.target = self
             button.action = #selector(togglePopover)
@@ -522,6 +523,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     screen.visibleFrame.maxX - size.width - 8)
         panel.setFrame(NSRect(x: x, y: top - size.height, width: size.width, height: size.height), display: true)
         panel.makeKeyAndOrderFront(nil)
+        button.state = .on
+        button.highlight(true)
+        // Mouse tracking clears the pressed highlight after the action returns.
+        // Reapply the panel's persistent selection on the next event-loop turn.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.statusItem.button?.highlight(self.panel.isVisible)
+        }
         watchOutsideClicks()
         if CommandLine.arguments.contains("--check-panel") {
             let frame = panel.frame
@@ -548,6 +557,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func hidePanel() {
         panel.orderOut(nil)
+        statusItem.button?.state = .off
+        statusItem.button?.highlight(false)
         stopOutsideClickMonitoring()
         stopShortcutRecording()
     }
