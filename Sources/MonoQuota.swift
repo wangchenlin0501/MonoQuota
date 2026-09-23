@@ -439,7 +439,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.onDisplayModeChanged = { [weak self] in self?.updateMeter() }
         if let button = statusItem.button {
             button.imagePosition = .imageOnly
-            button.cell?.showsStateBy = .changeBackgroundCellMask
+            (button.cell as? NSButtonCell)?.showsStateBy = .changeBackgroundCellMask
             button.toolTip = "Codex 剩余额度：5 小时与周额度"
             button.target = self
             button.action = #selector(togglePopover)
